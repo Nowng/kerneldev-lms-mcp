@@ -1,11 +1,18 @@
 """
 MM selftests management - category validation, TAP output parsing, and result formatting.
+
+Covers both VM-based selftests (tools/testing/selftests/mm) and host-side
+userspace tests (tools/testing/{radix-tree,vma,memblock}).
 """
 
+import asyncio
 import logging
+import os
 import re
+import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -270,5 +277,321 @@ def format_mmtests_result(result: MmtestsRunResult, max_failures: int = 20) -> s
 
     if result.log_file:
         lines.append(f"Full log: {result.log_file}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Host-side userspace mm tests (no VM required)
+# ---------------------------------------------------------------------------
+
+# Each suite: relative path from kernel root, make targets, test binaries
+HOST_TEST_SUITES: Dict[str, Dict] = {
+    "radix-tree": {
+        "path": "tools/testing/radix-tree",
+        "description": "radix-tree, xarray, maple tree, and IDR tests",
+        "make_target": "targets",
+        "binaries": ["main", "idr-test", "xarray", "maple"],
+    },
+    "vma": {
+        "path": "tools/testing/vma",
+        "description": "VMA merge, modify, expand, and shrink tests",
+        "make_target": "default",
+        "binaries": ["vma"],
+    },
+    "memblock": {
+        "path": "tools/testing/memblock",
+        "description": "memblock allocator tests",
+        "make_target": "main",
+        "binaries": ["main"],
+    },
+}
+
+
+def validate_host_suites(suites: List[str]) -> Tuple[bool, Optional[str]]:
+    """Validate host test suite names.
+
+    Args:
+        suites: List of suite names to validate
+
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if not suites:
+        return True, None
+
+    unknown = [s for s in suites if s not in HOST_TEST_SUITES]
+    if unknown:
+        valid = ", ".join(sorted(HOST_TEST_SUITES.keys()))
+        return False, (
+            f"Unknown suites: {', '.join(unknown)}. "
+            f"Valid suites: {valid}"
+        )
+    return True, None
+
+
+@dataclass
+class HostTestSuiteResult:
+    """Result of running a single host test suite."""
+
+    suite_name: str
+    success: bool
+    build_success: bool
+    build_output: str = ""
+    total: int = 0
+    passed: int = 0
+    failed: int = 0
+    run_output: str = ""
+    duration: float = 0.0
+    binary_results: Dict[str, bool] = field(default_factory=dict)
+
+
+@dataclass
+class HostMmtestsRunResult:
+    """Aggregate result of all host mm test suites."""
+
+    success: bool
+    suite_results: List[HostTestSuiteResult] = field(default_factory=list)
+    duration: float = 0.0
+
+    def summary(self) -> str:
+        total_suites = len(self.suite_results)
+        passed_suites = sum(1 for s in self.suite_results if s.success)
+        failed_suites = total_suites - passed_suites
+        icon = "✓" if self.success else "✗"
+        return f"{icon} {passed_suites}/{total_suites} suites passed, {self.duration:.1f}s"
+
+
+def _parse_vma_output(output: str) -> Tuple[int, int, int]:
+    """Parse vma test output: 'N tests run, M passed, K failed.'"""
+    m = re.search(r"(\d+)\s+tests?\s+run,\s+(\d+)\s+passed,\s+(\d+)\s+failed", output)
+    if m:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return 0, 0, 0
+
+
+def _check_assertion_output(output: str) -> bool:
+    """Check for assertion failures or sanitizer errors in output."""
+    fail_patterns = [
+        r"Assert FAILED",
+        r"Assertion .* failed",
+        r"runtime error:",           # UBSAN
+        r"ERROR: AddressSanitizer",   # ASAN
+        r"SUMMARY: .*Sanitizer",
+    ]
+    for pat in fail_patterns:
+        if re.search(pat, output):
+            return True
+    return False
+
+
+async def run_host_mmtests(
+    kernel_path: Path,
+    suites: Optional[List[str]] = None,
+    timeout: int = 300,
+    jobs: Optional[int] = None,
+) -> HostMmtestsRunResult:
+    """Build and run host-side mm test suites.
+
+    These tests compile against kernel headers and run directly on the host
+    without a VM.  They require liburcu-dev and libasan.
+
+    Args:
+        kernel_path: Path to kernel source tree
+        suites: List of suite names to run, or None for all
+        timeout: Timeout per suite in seconds
+        jobs: Parallel make jobs (default: CPU count)
+
+    Returns:
+        HostMmtestsRunResult with per-suite results
+    """
+    if suites is None:
+        suites = list(HOST_TEST_SUITES.keys())
+
+    if jobs is None:
+        jobs = os.cpu_count() or 1
+
+    start_time = time.time()
+    suite_results: List[HostTestSuiteResult] = []
+    all_success = True
+
+    for suite_name in suites:
+        info = HOST_TEST_SUITES[suite_name]
+        suite_dir = kernel_path / info["path"]
+        suite_start = time.time()
+
+        logger.info(f"--- {suite_name}: building ---")
+
+        if not suite_dir.exists():
+            sr = HostTestSuiteResult(
+                suite_name=suite_name,
+                success=False,
+                build_success=False,
+                build_output=f"Directory not found: {suite_dir}",
+            )
+            suite_results.append(sr)
+            all_success = False
+            continue
+
+        # Build
+        build_cmd = f"make -C {suite_dir} {info['make_target']} -j{jobs}"
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                build_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=str(kernel_path),
+            )
+            build_out_bytes, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+            build_output = build_out_bytes.decode(errors="replace")
+            build_ok = proc.returncode == 0
+        except asyncio.TimeoutError:
+            build_output = f"Build timed out after {timeout}s"
+            build_ok = False
+        except Exception as e:
+            build_output = str(e)
+            build_ok = False
+
+        if not build_ok:
+            logger.error(f"--- {suite_name}: build FAILED ---")
+            sr = HostTestSuiteResult(
+                suite_name=suite_name,
+                success=False,
+                build_success=False,
+                build_output=build_output,
+                duration=time.time() - suite_start,
+            )
+            suite_results.append(sr)
+            all_success = False
+            continue
+
+        logger.info(f"--- {suite_name}: running ---")
+
+        # Run each binary
+        binary_results: Dict[str, bool] = {}
+        combined_output_parts: List[str] = []
+        total = 0
+        passed = 0
+        failed = 0
+        suite_ok = True
+
+        for binary in info["binaries"]:
+            binary_path = suite_dir / binary
+            if not binary_path.exists():
+                binary_results[binary] = False
+                combined_output_parts.append(f"[{binary}] NOT FOUND")
+                suite_ok = False
+                continue
+
+            # memblock supports -v for verbose kselftest output
+            run_cmd = str(binary_path)
+            if suite_name == "memblock":
+                run_cmd += " -v"
+
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    run_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=str(suite_dir),
+                )
+                out_bytes, _ = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+                run_output = out_bytes.decode(errors="replace")
+                exit_code = proc.returncode
+            except asyncio.TimeoutError:
+                run_output = f"Timed out after {timeout}s"
+                exit_code = -1
+            except Exception as e:
+                run_output = str(e)
+                exit_code = -1
+
+            combined_output_parts.append(f"[{binary}] exit={exit_code}")
+            if run_output.strip():
+                combined_output_parts.append(run_output.rstrip())
+
+            # Determine pass/fail
+            has_assertion_fail = _check_assertion_output(run_output)
+
+            if suite_name == "vma":
+                t, p, f = _parse_vma_output(run_output)
+                total += t
+                passed += p
+                failed += f
+                bin_ok = (exit_code == 0 and f == 0)
+            else:
+                # radix-tree and memblock: exit 0 + no assertion/sanitizer errors = pass
+                total += 1
+                bin_ok = (exit_code == 0 and not has_assertion_fail)
+                if bin_ok:
+                    passed += 1
+                else:
+                    failed += 1
+
+            binary_results[binary] = bin_ok
+            if not bin_ok:
+                suite_ok = False
+
+        sr = HostTestSuiteResult(
+            suite_name=suite_name,
+            success=suite_ok,
+            build_success=True,
+            total=total,
+            passed=passed,
+            failed=failed,
+            run_output="\n".join(combined_output_parts),
+            duration=time.time() - suite_start,
+            binary_results=binary_results,
+        )
+        suite_results.append(sr)
+        if not suite_ok:
+            all_success = False
+
+        status = "✓" if suite_ok else "✗"
+        logger.info(f"--- {suite_name}: {status} ({sr.duration:.1f}s) ---")
+
+    return HostMmtestsRunResult(
+        success=all_success,
+        suite_results=suite_results,
+        duration=time.time() - start_time,
+    )
+
+
+def format_host_mmtests_result(result: HostMmtestsRunResult) -> str:
+    """Format host mm test results for display."""
+    lines = [result.summary(), ""]
+
+    for sr in result.suite_results:
+        icon = "✓" if sr.success else "✗"
+
+        if not sr.build_success:
+            lines.append(f"  {icon} {sr.suite_name}: BUILD FAILED ({sr.duration:.1f}s)")
+            # Show last few lines of build output
+            build_lines = sr.build_output.strip().splitlines()
+            for bl in build_lines[-5:]:
+                lines.append(f"      {bl}")
+        elif sr.suite_name == "vma":
+            lines.append(
+                f"  {icon} {sr.suite_name}: {sr.passed}/{sr.total} passed, "
+                f"{sr.failed} failed ({sr.duration:.1f}s)"
+            )
+        else:
+            # radix-tree / memblock: show per-binary status
+            parts = []
+            for binary, ok in sr.binary_results.items():
+                parts.append(f"{binary}={'ok' if ok else 'FAIL'}")
+            lines.append(
+                f"  {icon} {sr.suite_name}: {', '.join(parts)} ({sr.duration:.1f}s)"
+            )
+
+        # On failure, show some output
+        if not sr.success and sr.run_output:
+            for ol in sr.run_output.strip().splitlines()[-8:]:
+                lines.append(f"      {ol}")
+
+        lines.append("")
 
     return "\n".join(lines)

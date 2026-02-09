@@ -37,8 +37,12 @@ from .fstests_manager import (
 )
 from .mmtests_manager import (
     MM_TEST_CATEGORIES,
+    HOST_TEST_SUITES,
     validate_categories as validate_mmtests_categories,
+    validate_host_suites as validate_mmtests_host_suites,
     format_mmtests_result,
+    run_host_mmtests,
+    format_host_mmtests_result,
 )
 from .baseline_manager import BaselineManager, format_comparison_result
 from .git_manager import GitManager
@@ -1444,6 +1448,44 @@ Examples:
                         "type": "array",
                         "description": "Additional arguments to pass to vng",
                         "items": {"type": "string"},
+                    },
+                },
+                "required": ["kernel_path"],
+            },
+        ),
+        Tool(
+            name="mmtests_host_build_and_run",
+            description="""Build and run host-side mm userspace tests (no VM required).
+
+Builds and runs tests from tools/testing/{radix-tree,vma,memblock} directly
+on the host. These test data structures and allocators used by the mm
+subsystem without needing a VM or a built kernel image.
+
+Requires: liburcu-dev, libasan (AddressSanitizer runtime).
+
+Available suites:
+  - radix-tree: radix-tree, xarray, maple tree, and IDR tests
+  - vma: VMA merge, modify, expand, and shrink tests
+  - memblock: memblock allocator tests""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "kernel_path": {
+                        "type": "string",
+                        "description": "Path to kernel source directory",
+                    },
+                    "suites": {
+                        "type": "array",
+                        "description": "Test suites to run. If omitted, runs all. "
+                        "Valid suites: "
+                        + ", ".join(sorted(HOST_TEST_SUITES.keys())),
+                        "items": {"type": "string"},
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout per suite in seconds",
+                        "default": 300,
+                        "minimum": 30,
                     },
                 },
                 "required": ["kernel_path"],
@@ -3378,6 +3420,34 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     output += f"Failed: {mm_result.failed}, Passed: {mm_result.passed}\n"
             else:
                 output += "✗ mm selftests did not complete (boot failed or timed out)\n"
+
+            return [TextContent(type="text", text=output)]
+
+        elif name == "mmtests_host_build_and_run":
+            kernel_path = Path(arguments["kernel_path"])
+            suites = arguments.get("suites")
+            timeout = arguments.get("timeout", 300)
+
+            if not kernel_path.exists():
+                return [
+                    TextContent(
+                        type="text", text=f"Error: Kernel path does not exist: {kernel_path}"
+                    )
+                ]
+
+            if suites:
+                is_valid, error_msg = validate_mmtests_host_suites(suites)
+                if not is_valid:
+                    return [TextContent(type="text", text=f"Error: {error_msg}")]
+
+            result = await run_host_mmtests(
+                kernel_path=kernel_path,
+                suites=suites,
+                timeout=timeout,
+            )
+
+            output = "=== Host MM Tests ===\n\n"
+            output += format_host_mmtests_result(result)
 
             return [TextContent(type="text", text=output)]
 
