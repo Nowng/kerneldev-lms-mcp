@@ -35,6 +35,15 @@ from .fstests_manager import (
     TestResult,
     format_fstests_result,
 )
+from .mmtests_manager import (
+    MM_TEST_CATEGORIES,
+    HOST_TEST_SUITES,
+    validate_categories as validate_mmtests_categories,
+    validate_host_suites as validate_mmtests_host_suites,
+    format_mmtests_result,
+    run_host_mmtests,
+    format_host_mmtests_result,
+)
 from .baseline_manager import BaselineManager, format_comparison_result
 from .git_manager import GitManager
 from . import device_pool_tools
@@ -1371,6 +1380,113 @@ The results directory should contain a check.log file from a previous fstests ru
                     },
                     "branch_name": {"type": "string", "description": "Branch name to delete from"},
                     "commit_sha": {"type": "string", "description": "Commit SHA to delete from"},
+                },
+                "required": ["kernel_path"],
+            },
+        ),
+        Tool(
+            name="mmtests_vm_boot_and_run",
+            description="""Boot kernel in VM and run mm (memory management) selftests.
+
+Automatically:
+  - Boots your kernel in a VM with 2-node NUMA topology
+  - Builds mm selftests inside the VM (from tools/testing/selftests/mm)
+  - Runs run_vmtests.sh with specified categories
+  - Parses TAP output and reports results
+
+NUMA topology is configured automatically (memory and CPUs split across 2 nodes)
+so that ksm_numa, migration, and other NUMA-dependent tests work.
+
+Examples:
+  - Default tests: just provide kernel_path
+  - Specific categories: categories=["ksm", "thp"]
+  - All tests: run_all=true
+  - All + destructive: run_all=true, run_destructive=true""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "kernel_path": {
+                        "type": "string",
+                        "description": "Path to kernel source directory",
+                    },
+                    "categories": {
+                        "type": "array",
+                        "description": "Test categories to run (e.g., ['ksm', 'thp', 'mmap']). "
+                        "If omitted, runs the default set. "
+                        "Valid categories: "
+                        + ", ".join(sorted(MM_TEST_CATEGORIES.keys())),
+                        "items": {"type": "string"},
+                    },
+                    "run_all": {
+                        "type": "boolean",
+                        "description": "Run all tests including extra ones (pass -a to run_vmtests.sh)",
+                        "default": False,
+                    },
+                    "run_destructive": {
+                        "type": "boolean",
+                        "description": "Run destructive tests (pass -d to run_vmtests.sh)",
+                        "default": False,
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Boot and test timeout in seconds",
+                        "default": 600,
+                        "minimum": 60,
+                    },
+                    "memory": {
+                        "type": "string",
+                        "description": "VM memory size (split across 2 NUMA nodes)",
+                        "default": "4G",
+                    },
+                    "cpus": {
+                        "type": "integer",
+                        "description": "Number of CPUs (split across 2 NUMA nodes, minimum 2)",
+                        "default": 4,
+                        "minimum": 2,
+                    },
+                    "extra_args": {
+                        "type": "array",
+                        "description": "Additional arguments to pass to vng",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["kernel_path"],
+            },
+        ),
+        Tool(
+            name="mmtests_host_build_and_run",
+            description="""Build and run host-side mm userspace tests (no VM required).
+
+Builds and runs tests from tools/testing/{radix-tree,vma,memblock} directly
+on the host. These test data structures and allocators used by the mm
+subsystem without needing a VM or a built kernel image.
+
+Requires: liburcu-dev, libasan (AddressSanitizer runtime).
+
+Available suites:
+  - radix-tree: radix-tree, xarray, maple tree, and IDR tests
+  - vma: VMA merge, modify, expand, and shrink tests
+  - memblock: memblock allocator tests""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "kernel_path": {
+                        "type": "string",
+                        "description": "Path to kernel source directory",
+                    },
+                    "suites": {
+                        "type": "array",
+                        "description": "Test suites to run. If omitted, runs all. "
+                        "Valid suites: "
+                        + ", ".join(sorted(HOST_TEST_SUITES.keys())),
+                        "items": {"type": "string"},
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout per suite in seconds",
+                        "default": 300,
+                        "minimum": 30,
+                    },
                 },
                 "required": ["kernel_path"],
             },
@@ -3214,6 +3330,124 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             else:
                 location = commit_sha or branch_name or "current commit"
                 output = f"✗ Failed to delete results for {location}"
+
+            return [TextContent(type="text", text=output)]
+
+        elif name == "mmtests_vm_boot_and_run":
+            kernel_path = Path(arguments["kernel_path"])
+            categories = arguments.get("categories")
+            run_all = arguments.get("run_all", False)
+            run_destructive = arguments.get("run_destructive", False)
+            timeout = arguments.get("timeout", 600)
+            memory = arguments.get("memory", "4G")
+            cpus = arguments.get("cpus", 4)
+            extra_args = arguments.get("extra_args", [])
+
+            # Check kernel path exists
+            if not kernel_path.exists():
+                return [
+                    TextContent(
+                        type="text", text=f"Error: Kernel path does not exist: {kernel_path}"
+                    )
+                ]
+
+            # Validate categories if provided
+            if categories:
+                is_valid, error_msg = validate_mmtests_categories(categories)
+                if not is_valid:
+                    return [TextContent(type="text", text=f"Error: {error_msg}")]
+
+            # Validate kernel config has mm-selftests fragment options
+            config_warnings = ""
+            config_file = kernel_path / ".config"
+            if config_file.exists():
+                try:
+                    from .templates import TemplateManager
+                    from .config_manager import KernelConfig
+
+                    tm = TemplateManager()
+                    fragment = tm.get_fragment("mm-selftests")
+                    if fragment:
+                        required = KernelConfig.from_config_text(fragment.load())
+                        actual = KernelConfig.from_file(config_file)
+                        missing = []
+                        for opt_name, opt in required.options.items():
+                            actual_opt = actual.get_option(opt_name)
+                            if actual_opt is None or actual_opt.value != opt.value:
+                                have = actual_opt.value if actual_opt else "not set"
+                                missing.append(f"  {opt_name}={opt.value} (have: {have})")
+                        if missing:
+                            config_warnings = (
+                                f"⚠ Kernel .config is missing {len(missing)} mm-selftests options "
+                                f"(some tests will be skipped):\n"
+                                + "\n".join(missing)
+                                + "\nFix: use merge_configs with 'mm-selftests' fragment, apply_config, and rebuild\n\n"
+                            )
+                except Exception:
+                    pass
+
+            # Create boot manager
+            try:
+                boot_mgr = BootManager(kernel_path)
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error creating BootManager: {str(e)}")]
+
+            # Boot with mm selftests
+            boot_result, mm_result = await boot_mgr.boot_with_mmtests(
+                categories=categories,
+                run_all=run_all,
+                run_destructive=run_destructive,
+                timeout=timeout,
+                memory=memory,
+                cpus=cpus,
+                extra_args=extra_args,
+            )
+
+            # Format output
+            output = ""
+            if config_warnings:
+                output += config_warnings
+            output += "=== Kernel Boot with MM Selftests ===\n\n"
+            output += format_boot_result(boot_result)
+            output += "\n\n"
+
+            if mm_result:
+                output += "=== MM Selftests Results ===\n\n"
+                output += format_mmtests_result(mm_result)
+
+                if not mm_result.success:
+                    output += "\n⚠ WARNING: mm selftests completed but some tests FAILED\n"
+                    output += f"Failed: {mm_result.failed}, Passed: {mm_result.passed}\n"
+            else:
+                output += "✗ mm selftests did not complete (boot failed or timed out)\n"
+
+            return [TextContent(type="text", text=output)]
+
+        elif name == "mmtests_host_build_and_run":
+            kernel_path = Path(arguments["kernel_path"])
+            suites = arguments.get("suites")
+            timeout = arguments.get("timeout", 300)
+
+            if not kernel_path.exists():
+                return [
+                    TextContent(
+                        type="text", text=f"Error: Kernel path does not exist: {kernel_path}"
+                    )
+                ]
+
+            if suites:
+                is_valid, error_msg = validate_mmtests_host_suites(suites)
+                if not is_valid:
+                    return [TextContent(type="text", text=f"Error: {error_msg}")]
+
+            result = await run_host_mmtests(
+                kernel_path=kernel_path,
+                suites=suites,
+                timeout=timeout,
+            )
+
+            output = "=== Host MM Tests ===\n\n"
+            output += format_host_mmtests_result(result)
 
             return [TextContent(type="text", text=output)]
 

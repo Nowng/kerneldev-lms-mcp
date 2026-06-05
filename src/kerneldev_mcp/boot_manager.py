@@ -3607,6 +3607,410 @@ exit $exit_code
             if device_manager:
                 device_manager.cleanup()
 
+    async def boot_with_mmtests(
+        self,
+        categories: Optional[List[str]] = None,
+        run_all: bool = False,
+        run_destructive: bool = False,
+        timeout: int = 600,
+        memory: str = "4G",
+        cpus: int = 4,
+        cross_compile: Optional["CrossCompileConfig"] = None,
+        extra_args: Optional[List[str]] = None,
+    ) -> Tuple[BootResult, Optional[object]]:
+        """Boot kernel and run mm selftests inside VM.
+
+        Builds the mm selftests inside the VM using an overlay on the kernel
+        tree, then runs run_vmtests.sh.  A 2-node NUMA topology is configured
+        automatically so that ksm_numa and migration tests work.
+
+        Args:
+            categories: List of test categories to run (e.g., ["ksm", "thp"]).
+                       If None and run_all is False, runs the default set.
+            run_all: Pass -a to run_vmtests.sh (all tests except destructive)
+            run_destructive: Pass -d to run_vmtests.sh (destructive tests)
+            timeout: Total timeout in seconds
+            memory: Memory size for VM (e.g., "4G")
+            cpus: Number of CPUs (minimum 2 for NUMA split)
+            cross_compile: Cross-compilation configuration
+            extra_args: Additional arguments to pass to vng
+
+        Returns:
+            Tuple of (BootResult, MmtestsRunResult or None)
+        """
+        from .mmtests_manager import (
+            validate_categories,
+            parse_tap_output,
+            MmtestsRunResult,
+        )
+
+        logger.info("=" * 60)
+        logger.info(f"Starting kernel boot with mm selftests: {self.kernel_path}")
+        logger.info(f"Config: memory={memory}, cpus={cpus}, timeout={timeout}s")
+        if categories:
+            logger.info(f"Categories: {' '.join(categories)}")
+        elif run_all:
+            logger.info("Running all tests (-a)")
+        else:
+            logger.info("Running default test set")
+        if run_destructive:
+            logger.info("Destructive tests enabled (-d)")
+        if cross_compile:
+            logger.info(f"Cross-compile arch: {cross_compile.arch}")
+
+        # Validate categories
+        if categories:
+            is_valid, error_msg = validate_categories(categories)
+            if not is_valid:
+                logger.error(f"✗ Invalid categories: {error_msg}")
+                logger.info("=" * 60)
+                return (
+                    BootResult(
+                        success=False,
+                        duration=0.0,
+                        boot_completed=False,
+                        dmesg_output=f"ERROR: {error_msg}",
+                        exit_code=-1,
+                    ),
+                    None,
+                )
+
+        # Enforce minimum 2 CPUs for NUMA
+        if cpus < 2:
+            cpus = 2
+            logger.info("Adjusted cpus to 2 (minimum for NUMA topology)")
+
+        start_time = time.time()
+        script_file = None
+
+        try:
+            # Check virtme-ng is available
+            if not self.check_virtme_ng():
+                logger.error("✗ virtme-ng not found")
+                logger.info("=" * 60)
+                return (
+                    BootResult(
+                        success=False,
+                        duration=time.time() - start_time,
+                        boot_completed=False,
+                        dmesg_output="ERROR: virtme-ng (vng) not found. Install with: pip install virtme-ng",
+                        exit_code=-1,
+                    ),
+                    None,
+                )
+
+            # Auto-detect kernel architecture if not explicitly specified
+            target_arch = self._resolve_target_architecture(cross_compile)
+
+            # Check QEMU is available for target architecture
+            qemu_available, qemu_info = self.check_qemu(target_arch)
+            if not qemu_available:
+                logger.error(f"✗ QEMU not found: {qemu_info}")
+                logger.info("=" * 60)
+                return (
+                    BootResult(
+                        success=False,
+                        duration=time.time() - start_time,
+                        boot_completed=False,
+                        dmesg_output=f"ERROR: {qemu_info}",
+                        exit_code=-1,
+                    ),
+                    None,
+                )
+            else:
+                logger.info(f"✓ QEMU available: {qemu_info}")
+
+            # Check if kernel is built
+            vmlinux = self.kernel_path / "vmlinux"
+            if not vmlinux.exists():
+                return (
+                    BootResult(
+                        success=False,
+                        duration=time.time() - start_time,
+                        boot_completed=False,
+                        dmesg_output=f"ERROR: Kernel not built. vmlinux not found at {vmlinux}",
+                        exit_code=-1,
+                    ),
+                    None,
+                )
+
+            # Validate kernel config has mm-selftests fragment options
+            config_path = self.kernel_path / ".config"
+            if config_path.exists():
+                try:
+                    from .templates import TemplateManager
+                    from .config_manager import KernelConfig
+
+                    tm = TemplateManager()
+                    fragment = tm.get_fragment("mm-selftests")
+                    if fragment:
+                        required = KernelConfig.from_config_text(fragment.load())
+                        actual = KernelConfig.from_file(config_path)
+                        missing = []
+                        for name, opt in required.options.items():
+                            actual_opt = actual.get_option(name)
+                            if actual_opt is None or actual_opt.value != opt.value:
+                                missing.append(f"{name}={opt.value} (have: {actual_opt.value if actual_opt else 'not set'})")
+                        if missing:
+                            logger.warning(
+                                f"Kernel .config is missing {len(missing)} mm-selftests options "
+                                f"(some tests will be skipped):"
+                            )
+                            for m in missing:
+                                logger.warning(f"  {m}")
+                            logger.warning(
+                                "Fix with: merge_configs + apply_config with 'mm-selftests' fragment, then rebuild"
+                            )
+                        else:
+                            logger.info("✓ Kernel config has all mm-selftests fragment options")
+                except Exception as e:
+                    logger.debug(f"Could not validate mm-selftests config: {e}")
+
+            # Build run_vmtests.sh flags
+            vmtest_flags = ""
+            if categories:
+                vmtest_flags += f' -t "{" ".join(categories)}"'
+            if run_all:
+                vmtest_flags += " -a"
+            if run_destructive:
+                vmtest_flags += " -d"
+
+            # Create the in-VM script: build selftests then run
+            test_script = f"""#!/bin/bash
+set +e
+
+echo "=== MM Selftests Setup ==="
+echo "Kernel: $(uname -r)"
+echo ""
+
+# Show NUMA topology
+echo "NUMA topology:"
+if command -v numactl &>/dev/null; then
+    numactl --hardware 2>/dev/null || true
+elif [ -d /sys/devices/system/node ]; then
+    for node in /sys/devices/system/node/node*; do
+        n=$(basename $node)
+        cpulist=$(cat $node/cpulist 2>/dev/null || echo "?")
+        meminfo=$(grep MemTotal $node/meminfo 2>/dev/null | awk '{{print $4, $5}}')
+        echo "  $n: cpus=$cpulist mem=$meminfo"
+    done
+fi
+echo ""
+
+# Build mm selftests
+echo "=== Building MM Selftests ==="
+make -C {self.kernel_path}/tools/testing/selftests/mm -j$(nproc) 2>&1
+build_ret=$?
+if [ $build_ret -ne 0 ]; then
+    echo "ERROR: Build failed with exit code $build_ret"
+    exit $build_ret
+fi
+echo "Build successful"
+echo ""
+
+# Run selftests
+echo "=== MM Selftests Execution ==="
+cd {self.kernel_path}/tools/testing/selftests/mm
+bash run_vmtests.sh{vmtest_flags}
+exit_code=$?
+echo ""
+echo "=== MM Selftests Complete ==="
+echo "Exit code: $exit_code"
+exit $exit_code
+"""
+
+            # Write script to temp file
+            script_file = Path("/tmp/run-mm-selftests.sh")
+            script_file.write_text(test_script)
+            script_file.chmod(0o755)
+
+            # Build vng command
+            cmd = ["vng", "--verbose"]
+
+            # Add architecture if specified or auto-detected
+            if target_arch:
+                cmd.extend(["--arch", target_arch])
+
+            # Use q35 machine type unless user specified their own
+            machine_opts = _prepare_vng_qemu_opts(extra_args)
+            cmd.extend(machine_opts)
+
+            # Configure 2-node NUMA topology
+            numa_args = _build_mm_numa_args(memory, cpus)
+            cmd.extend(numa_args)
+
+            cmd.extend(["--cpus", str(cpus)])
+
+            # Writable overlay on kernel tree so selftests can be built
+            cmd.extend(["--overlay-rwdir", str(self.kernel_path)])
+
+            # Add any extra arguments
+            if extra_args:
+                cmd.extend(extra_args)
+
+            # Execute the test script
+            cmd.extend(["--", "bash", str(script_file)])
+
+            logger.info(f"Booting kernel and running mm selftests... (timeout: {timeout}s)")
+            logger.info("  Progress updates will be logged every 10 seconds")
+            for handler in logger.handlers:
+                handler.flush()
+
+            description = f"mm-selftests on {self.kernel_path.name}"
+            exit_code, output, progress_messages, log_file = await _run_with_pty_async(
+                cmd, self.kernel_path, timeout, emit_output=True, description=description
+            )
+
+            duration = time.time() - start_time
+
+            # Parse TAP output
+            mm_result = parse_tap_output(output)
+            mm_result.duration = duration
+            mm_result.log_file = str(log_file) if log_file else None
+
+            # Analyze dmesg for kernel issues
+            errors, warnings, panics, oops = DmesgParser.analyze_dmesg(output)
+
+            boot_completed = exit_code >= 0
+            boot_success = boot_completed and len(panics) == 0
+
+            if boot_success:
+                logger.info(f"✓ mm selftests completed in {duration:.1f}s")
+                logger.info(
+                    f"  Tests: {mm_result.passed} passed, {mm_result.failed} failed, "
+                    f"{mm_result.skipped} skipped"
+                )
+            else:
+                logger.error(f"✗ mm selftests failed after {duration:.1f}s")
+                logger.error(f"  Panics: {len(panics)}, Oops: {len(oops)}, Errors: {len(errors)}")
+
+            logger.info(f"Boot log saved: {log_file}")
+            logger.info("=" * 60)
+            for handler in logger.handlers:
+                handler.flush()
+
+            timeout_occurred = exit_code == -1 and "timed out" in output.lower()
+
+            boot_result = BootResult(
+                success=boot_success,
+                duration=duration,
+                boot_completed=boot_completed,
+                errors=errors,
+                warnings=warnings,
+                panics=panics,
+                oops=oops,
+                dmesg_output=output,
+                exit_code=exit_code,
+                timeout_occurred=timeout_occurred,
+                log_file_path=log_file,
+                progress_log=progress_messages,
+            )
+
+            return (boot_result, mm_result)
+
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"✗ mm selftests failed with exception: {e}")
+
+            log_file = None
+            try:
+                if BOOT_LOG_DIR.exists():
+                    recent_logs = sorted(
+                        BOOT_LOG_DIR.glob("boot-*-running.log"),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    if recent_logs and (time.time() - recent_logs[0].stat().st_mtime) < 60:
+                        log_file = recent_logs[0]
+                        try:
+                            error_log = log_file.parent / log_file.name.replace(
+                                "-running.log", "-error.log"
+                            )
+                            log_file.rename(error_log)
+                            log_file = error_log
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            if not log_file:
+                error_output = f"ERROR: {str(e)}"
+                log_file = _save_boot_log(error_output, success=False)
+
+            logger.info(f"Boot log saved: {log_file}")
+            logger.info("=" * 60)
+            for handler in logger.handlers:
+                handler.flush()
+
+            return (
+                BootResult(
+                    success=False,
+                    duration=duration,
+                    boot_completed=False,
+                    dmesg_output=f"ERROR: {str(e)}",
+                    exit_code=-1,
+                    log_file_path=log_file,
+                ),
+                None,
+            )
+
+        finally:
+            if script_file and script_file.exists():
+                try:
+                    script_file.unlink()
+                except OSError:
+                    pass
+
+
+def _build_mm_numa_args(memory: str, cpus: int) -> List[str]:
+    """Build QEMU NUMA arguments for a 2-node topology.
+
+    Splits memory and CPUs evenly across 2 NUMA nodes.  When --numa is used
+    with vng, do NOT also pass --memory (QEMU would get conflicting options).
+
+    Args:
+        memory: Memory string like "4G" or "2048M"
+        cpus: Total number of CPUs
+
+    Returns:
+        List of vng arguments for NUMA configuration
+    """
+    # Parse memory string
+    m = re.match(r"^(\d+)\s*(G|M|K)?$", memory, re.IGNORECASE)
+    if not m:
+        # Fallback: pass memory as-is and skip NUMA
+        logger.warning(f"Could not parse memory '{memory}' for NUMA split, skipping NUMA")
+        return ["--memory", memory]
+
+    size = int(m.group(1))
+    unit = (m.group(2) or "M").upper()
+
+    # Convert to MB for splitting
+    if unit == "G":
+        total_mb = size * 1024
+    elif unit == "K":
+        total_mb = max(size // 1024, 256)
+    else:
+        total_mb = size
+
+    # Split memory across 2 nodes
+    node0_mb = total_mb // 2
+    node1_mb = total_mb - node0_mb
+
+    # Split CPUs across 2 nodes
+    half_cpus = cpus // 2
+    node0_cpus = f"0-{half_cpus - 1}" if half_cpus > 1 else "0"
+    node1_cpus = f"{half_cpus}-{cpus - 1}" if (cpus - half_cpus) > 1 else str(half_cpus)
+
+    numa_opts = (
+        f"-numa node,nodeid=0,cpus={node0_cpus},memdev=m0 "
+        f"-numa node,nodeid=1,cpus={node1_cpus},memdev=m1 "
+        f"-object memory-backend-ram,size={node0_mb}M,id=m0 "
+        f"-object memory-backend-ram,size={node1_mb}M,id=m1"
+    )
+
+    return [f"--qemu-opts={numa_opts}"]
+
 
 def format_boot_result(result: BootResult, max_errors: int = 10) -> str:
     """Format boot result for display.
