@@ -1,0 +1,7 @@
+{
+  "type": "plugin",
+  "runner": "node",
+  "owner": "hoonowng",
+  "name": "kerneldev-lms-mcp",
+  "revision": 1
+}

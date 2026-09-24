@@ -1,0 +1,26 @@
+{
+  "name": "kerneldev-lms-mcp",
+  "version": "0.1.0",
+  "description": "LM Studio Plugin: Linux kernel development configuration & build MCP server (TypeScript wrapper for kerneldev-mcp)",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "lms dev",
+    "push": "lms push",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit",
+    "postinstall": "node scripts/setup.cjs"
+  },
+  "author": "hoonowng",
+  "license": "GPL-2.0",
+  "dependencies": {
+    "@lmstudio/sdk": "^2.0.0",
+    "@modelcontextprotocol/sdk": "^1.10.0",
+    "zod": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  }
+}
